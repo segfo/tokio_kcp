@@ -17,11 +17,140 @@ use tokio::{
 
 use crate::{config::KcpConfig, session::KcpSession, skcp::KcpSocket};
 
+#[derive(Debug)]
+pub struct Receiver {
+    session: Arc<KcpSession>,
+    buffer: Vec<u8>,
+    buffer_pos: usize,
+    buffer_cap: usize,
+}
+impl Receiver {
+    fn new(session: Arc<KcpSession>) -> Self {
+        Receiver {
+            session,
+            buffer: Vec::new(),
+            buffer_pos: 0,
+            buffer_cap: 0,
+        }
+    }
+
+    /// `recv` data into `buf`
+    pub fn poll_recv(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<KcpResult<usize>> {
+        loop {
+            // Consumes all data in buffer
+            {
+                let recv_buffer_pos = self.buffer_pos;
+                let recv_buffer_cap = self.buffer_cap;
+                if recv_buffer_pos < recv_buffer_cap {
+                    let remaining = recv_buffer_cap - recv_buffer_pos;
+                    let copy_length = remaining.min(buf.len());
+
+                    buf[..copy_length].copy_from_slice(&self.buffer[recv_buffer_pos..recv_buffer_pos + copy_length]);
+                    self.buffer_pos += copy_length;
+                    return Ok(copy_length).into();
+                }
+            }
+
+            // Mutex doesn't have poll_lock, spinning on it.
+            let mut kcp = self.session.kcp_socket().lock();
+
+            // Try to read from KCP
+            // 1. Read directly with user provided `buf`
+            let peek_size = kcp.peek_size().unwrap_or(0);
+
+            // 1.1. User's provided buffer is larger than available buffer's size
+            if peek_size > 0 && peek_size <= buf.len() {
+                match ready!(kcp.poll_recv(cx, buf)) {
+                    Ok(n) => {
+                        trace!("[CLIENT] recv directly {} bytes", n);
+                        return Ok(n).into();
+                    }
+                    Err(KcpError::UserBufTooSmall) => {}
+                    Err(err) => return Err(err).into(),
+                }
+            }
+
+            // 2. User `buf` too small, read to recv_buffer
+            let required_size = peek_size;
+            {
+                if self.buffer.len() < required_size {
+                    self.buffer.resize(required_size, 0);
+                }
+                match ready!(kcp.poll_recv(cx, &mut self.buffer)) {
+                    Ok(0) => return Ok(0).into(),
+                    Ok(n) => {
+                        trace!("[CLIENT] recv buffered {} bytes", n);
+                        self.buffer_pos = 0;
+                        self.buffer_cap = n;
+                    }
+                    Err(err) => return Err(err).into(),
+                }
+            }
+        }
+    }
+
+    /// `recv` data into `buf`
+    pub async fn recv(&mut self, buf: &mut [u8]) -> KcpResult<usize> {
+        future::poll_fn(|cx| self.poll_recv(cx, buf)).await
+    }
+}
+macro_rules! async_run {
+    ($block:expr) => {{
+        futures::executor::block_on($block)
+    }};
+}
+pub struct Transmitter {
+    session: Arc<KcpSession>,
+}
+impl Transmitter {
+    fn new(session: Arc<KcpSession>) -> Self {
+        Transmitter { session }
+    }
+
+    /// `send` data in `buf`
+    pub fn poll_send(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<KcpResult<usize>> {
+        // Mutex doesn't have poll_lock, spinning on it.
+        let mut kcp = self.session.kcp_socket().lock();
+        let result = ready!(kcp.poll_send(cx, buf));
+        self.session.notify();
+        result.into()
+    }
+
+    /// `send` data in `buf`
+    pub async fn send(&mut self, buf: &[u8]) -> KcpResult<usize> {
+        future::poll_fn(|cx| self.poll_send(cx, buf)).await
+    }
+}
+
+pub struct OwnedWriteHalf {
+    inner: Arc<Mutex<Transmitter>>,
+}
+impl OwnedWriteHalf {
+    pub fn poll_send(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<KcpResult<usize>> {
+        async_run!(async { self.inner.lock().await.poll_send(cx, buf) })
+    }
+    pub async fn send(&mut self, buf: &[u8]) -> KcpResult<usize> {
+        self.inner.lock().await.send(buf).await
+    }
+}
+#[derive(Debug)]
+pub struct OwnedReadHalf {
+    inner: Arc<Mutex<Receiver>>,
+}
+impl OwnedReadHalf {
+    pub fn poll_recv(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<KcpResult<usize>> {
+        async_run!(async { self.inner.lock().await.poll_recv(cx, buf) })
+    }
+    pub async fn recv(&mut self, buf: &mut [u8]) -> KcpResult<usize> {
+        self.inner.lock().await.recv(buf).await
+    }
+}
+use tokio::sync::Mutex;
+// use std::sync::Mutex;
 pub struct KcpStream {
     session: Arc<KcpSession>,
-    recv_buffer: Vec<u8>,
-    recv_buffer_pos: usize,
-    recv_buffer_cap: usize,
+    receiver: Arc<Mutex<Receiver>>,
+    transmitter: Arc<Mutex<Transmitter>>,
 }
 
 impl Drop for KcpStream {
@@ -32,12 +161,15 @@ impl Drop for KcpStream {
 
 impl Debug for KcpStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("KcpStream")
-            .field("session", self.session.as_ref())
-            .field("recv_buffer.len", &self.recv_buffer.len())
-            .field("recv_buffer_pos", &self.recv_buffer_pos)
-            .field("recv_buffer_cap", &self.recv_buffer_cap)
-            .finish()
+        async_run!(async {
+            let lock = self.receiver.lock().await;
+            f.debug_struct("KcpStream")
+                .field("session", self.session.as_ref())
+                .field("recv_buffer.len", &lock.buffer.len())
+                .field("recv_buffer_pos", &lock.buffer_pos)
+                .field("recv_buffer_cap", &lock.buffer_cap)
+                .finish()
+        })
     }
 }
 
@@ -65,87 +197,40 @@ impl KcpStream {
 
     pub(crate) fn with_session(session: Arc<KcpSession>) -> KcpStream {
         KcpStream {
-            session,
-            recv_buffer: Vec::new(),
-            recv_buffer_pos: 0,
-            recv_buffer_cap: 0,
+            session: session.clone(),
+            receiver: Arc::new(Mutex::new(Receiver::new(session.clone()))),
+            transmitter: Arc::new(Mutex::new(Transmitter::new(session))),
         }
     }
-
-    /// `send` data in `buf`
     pub fn poll_send(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<KcpResult<usize>> {
-        // Mutex doesn't have poll_lock, spinning on it.
-        let mut kcp = self.session.kcp_socket().lock();
-        let result = ready!(kcp.poll_send(cx, buf));
-        self.session.notify();
-        result.into()
+        async_run!(async {self.transmitter.lock().await.poll_send(cx, buf)})
     }
-
-    /// `send` data in `buf`
     pub async fn send(&mut self, buf: &[u8]) -> KcpResult<usize> {
-        future::poll_fn(|cx| self.poll_send(cx, buf)).await
+        self.transmitter.lock().await.send(buf).await
     }
 
-    /// `recv` data into `buf`
-    pub fn poll_recv(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<KcpResult<usize>> {
-        loop {
-            // Consumes all data in buffer
-            if self.recv_buffer_pos < self.recv_buffer_cap {
-                let remaining = self.recv_buffer_cap - self.recv_buffer_pos;
-                let copy_length = remaining.min(buf.len());
-
-                buf[..copy_length]
-                    .copy_from_slice(&self.recv_buffer[self.recv_buffer_pos..self.recv_buffer_pos + copy_length]);
-                self.recv_buffer_pos += copy_length;
-                return Ok(copy_length).into();
-            }
-
-            // Mutex doesn't have poll_lock, spinning on it.
-            let mut kcp = self.session.kcp_socket().lock();
-
-            // Try to read from KCP
-            // 1. Read directly with user provided `buf`
-            let peek_size = kcp.peek_size().unwrap_or(0);
-
-            // 1.1. User's provided buffer is larger than available buffer's size
-            if peek_size > 0 && peek_size <= buf.len() {
-                match ready!(kcp.poll_recv(cx, buf)) {
-                    Ok(n) => {
-                        trace!("[CLIENT] recv directly {} bytes", n);
-                        return Ok(n).into();
-                    }
-                    Err(KcpError::UserBufTooSmall) => {}
-                    Err(err) => return Err(err).into(),
-                }
-            }
-
-            // 2. User `buf` too small, read to recv_buffer
-            let required_size = peek_size;
-            if self.recv_buffer.len() < required_size {
-                self.recv_buffer.resize(required_size, 0);
-            }
-
-            match ready!(kcp.poll_recv(cx, &mut self.recv_buffer)) {
-                Ok(0) => return Ok(0).into(),
-                Ok(n) => {
-                    trace!("[CLIENT] recv buffered {} bytes", n);
-                    self.recv_buffer_pos = 0;
-                    self.recv_buffer_cap = n;
-                }
-                Err(err) => return Err(err).into(),
-            }
-        }
-    }
-
-    /// `recv` data into `buf`
     pub async fn recv(&mut self, buf: &mut [u8]) -> KcpResult<usize> {
-        future::poll_fn(|cx| self.poll_recv(cx, buf)).await
+        self.receiver.lock().await.recv(buf).await
+    }
+    pub fn poll_recv(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<KcpResult<usize>> {
+        async_run!(async {self.receiver.lock().await.poll_recv(cx, buf)})
+    }
+
+    pub fn split_owned(&self) -> (OwnedWriteHalf, OwnedReadHalf) {
+        (
+            OwnedWriteHalf {
+                inner: self.transmitter.clone(),
+            },
+            OwnedReadHalf {
+                inner: self.receiver.clone(),
+            },
+        )
     }
 }
 
 impl AsyncRead for KcpStream {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        match ready!(self.poll_recv(cx, buf.initialize_unfilled())) {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        match ready!(async_run!(async{ self.receiver.lock().await.poll_recv(cx, buf.initialize_unfilled())})) {
             Ok(n) => {
                 buf.advance(n);
                 Ok(()).into()
@@ -157,8 +242,8 @@ impl AsyncRead for KcpStream {
 }
 
 impl AsyncWrite for KcpStream {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        match ready!(self.poll_send(cx, buf)) {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        match ready!(async_run!(async {self.transmitter.lock().await.poll_send(cx, buf)})) {
             Ok(n) => Ok(n).into(),
             Err(KcpError::IoError(err)) => Err(err).into(),
             Err(err) => Err(io::Error::new(ErrorKind::Other, err)).into(),
