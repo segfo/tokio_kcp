@@ -99,6 +99,8 @@ macro_rules! async_run {
         futures::executor::block_on($block)
     }};
 }
+
+#[derive(Debug)]
 pub struct Transmitter {
     session: Arc<KcpSession>,
 }
@@ -122,6 +124,7 @@ impl Transmitter {
     }
 }
 
+#[derive(Debug)]
 pub struct OwnedWriteHalf {
     inner: Arc<Mutex<Transmitter>>,
 }
